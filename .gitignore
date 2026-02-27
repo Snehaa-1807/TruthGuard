@@ -1,0 +1,29 @@
+# Node
+node_modules/
+npm-debug.log*
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+*.egg-info/
+
+# ML model files (large binaries)
+ml/model/model.pkl
+ml/model/tfidf.pkl
+ml/dataset/*.csv
+
+# Build
+client/dist/
+client/.vite/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
