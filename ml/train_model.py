@@ -1,16 +1,12 @@
 """
-TruthGuard - ML Training Pipeline
-==================================
-NLP Pipeline: Lowercasing → Tokenization → Stopword Removal → Lemmatization
-Feature Extraction: TF-IDF (unigrams + bigrams)
-Models: Logistic Regression, Naive Bayes, Random Forest
-Selection: Best model by accuracy on held-out test set
+TruthGuard - ML Training Pipeline v3
+Features:
+  - TF-IDF (unigrams + bigrams + trigrams)
+  - 20 hand-crafted features covering ALL fake news styles
+  - Gradient Boosting as additional model
+  - Selects best by F1 on FAKE class
 """
-
-import os
-import re
-import sys
-import json
+import os, re, sys, json
 import joblib
 import numpy as np
 import pandas as pd
@@ -21,249 +17,261 @@ from nltk.stem import WordNetLemmatizer
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.linear_model import LogisticRegression
 from sklearn.naive_bayes import MultinomialNB
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.model_selection import train_test_split, cross_val_score
-from sklearn.metrics import (
-    accuracy_score, classification_report,
-    confusion_matrix, roc_auc_score
-)
-from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import LabelEncoder
+from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score, classification_report, f1_score
+from scipy.sparse import hstack, csr_matrix
 
-# ── Download NLTK assets ──────────────────────────────────────────────────────
-print("📦 Downloading NLTK assets...")
-for pkg in ["punkt", "stopwords", "wordnet", "omw-1.4", "punkt_tab"]:
+for pkg in ["punkt","stopwords","wordnet","omw-1.4","punkt_tab"]:
     nltk.download(pkg, quiet=True)
 
 STOP_WORDS = set(stopwords.words("english"))
 lemmatizer = WordNetLemmatizer()
 
-# ── Text Preprocessing ────────────────────────────────────────────────────────
-def preprocess(text: str) -> str:
-    """
-    Full NLP preprocessing pipeline:
-    1. Lowercase
-    2. Remove URLs, special chars, numbers
-    3. Tokenize
-    4. Remove stopwords
-    5. Lemmatize
-    """
-    if not isinstance(text, str):
-        return ""
+# ── 20 hand-crafted features ──────────────────────────────────────────────────
+FAKE_KEYWORDS = [
+    # Sensationalist
+    "breaking","shocking","exposed","urgent","bombshell","leaked","whistleblower",
+    "censored","banned","silenced","coverup","cover-up","hoax","conspiracy",
+    "deep state","globalist","cabal","mainstream media","sheeple","wake up",
+    "new world order","big pharma","microchip","plandemic","depopulation",
+    "chemtrails","false flag","inside job","shadow government","illuminati",
+    "satanic","bioweapon","suppressed","do your own research","share before",
+    "god bless","patriots","terrified","panicking","must share","spread the word",
+    # Calm medical fake
+    "doctors warn","health alert","doctors say","experts warn","doctors claim",
+    "circulating online","viral post","widely shared","spreading on social media",
+    "allegedly comes from","reportedly based on","unverified","cannot be confirmed",
+    "no official statement","no peer-reviewed","not been published","cannot be found",
+    "home remedy","natural cure","miracle","won't tell you","out of business",
+    "try this","share your results","thousands claim","reportedly cured",
+    # Pseudoscience
+    "colloidal silver","baking soda cure","alkaline water","essential oil cure",
+    "big pharma hiding","doctors are paid","fda suppressing","pharmaceutical hiding",
+]
 
-    # 1. Lowercase
-    text = text.lower()
+REAL_KEYWORDS = [
+    "study","research","published","journal","findings","data","analysis",
+    "peer-reviewed","clinical trial","randomized","controlled","methodology",
+    "participants","researchers","scientists","professor","doctor","official",
+    "report","statistics","percent","average","survey","sample","cohort",
+    "according to","cited","confirmed","announced","statement","evidence",
+    "independent","verified","review","institution","university","department",
+    "agency","committee","spokesperson","budget","forecast","projection",
+    "double-blind","placebo","ethics board","replication","meta-analysis",
+    "confidence interval","p-value","longitudinal","cross-sectional","funded by",
+]
 
-    # 2. Remove URLs
-    text = re.sub(r"http\S+|www\S+", " ", text)
+VAGUE_SOURCE_PATTERNS = [
+    r"(allegedly|reportedly|claimed|circulating|viral|widely shared)",
+    r"(no official statement|unverified|cannot be confirmed|not been published)",
+    r"(anonymous|unnamed|secret source|undisclosed|cannot be named)",
+    r"(some experts|many doctors|health experts say|specialists claim)",
+    r"(a message circulating|a post (claims|warns|states|alleges))",
+    r"(the warning allegedly|the study (cited|allegedly)|supposedly from)",
+]
 
-    # 3. Remove special characters and digits
-    text = re.sub(r"[^a-z\s]", " ", text)
+CITATION_PATTERNS = [
+    r"(published in|according to|study in|journal of|found in)",
+    r"(dr\.|prof\.|professor|researcher|scientist) [a-z]+ (said|noted|confirmed|found)",
+    r"(university|institute|hospital|agency|department|bureau|committee)",
+    r"(peer.reviewed|double.blind|randomized|clinical trial|ethics board)",
+    r"(funded by|no conflict|independent|verified by|reviewed by)",
+    r"\d+[,\d]* (participants|patients|subjects|adults|children|volunteers)",
+]
 
-    # 4. Tokenize
-    tokens = word_tokenize(text)
+def hand_features(text: str) -> list:
+    if not text:
+        return [0.0] * 20
+    words      = text.split()
+    wc         = max(len(words), 1)
+    tl         = text.lower()
 
-    # 5. Remove stopwords + short tokens + lemmatize
-    tokens = [
-        lemmatizer.lemmatize(t)
-        for t in tokens
-        if t not in STOP_WORDS and len(t) > 2
+    # 1. ALL CAPS word ratio
+    caps_ratio     = sum(1 for w in words if w.isupper() and len(w)>2) / wc
+    # 2. Exclamation density
+    excl_ratio     = min(text.count("!") / wc, 1.0)
+    # 3. Triple !!! count
+    triple_excl    = min(len(re.findall(r"!!!+", text)) / 3.0, 1.0)
+    # 4. Fake keyword hits
+    fake_hits      = sum(1 for k in FAKE_KEYWORDS if k in tl)
+    fake_ratio     = min(fake_hits / 12.0, 1.0)
+    # 5. Real keyword hits
+    real_hits      = sum(1 for k in REAL_KEYWORDS if k in tl)
+    real_ratio     = min(real_hits / 12.0, 1.0)
+    # 6. Net fake score
+    net_fake       = (fake_hits - real_hits) / max(fake_hits + real_hits, 1)
+    # 7. Has statistics (real)
+    has_stats      = 1.0 if re.search(r"\d+\.?\d*\s*(%|percent|million|billion|thousand)", tl) else 0.0
+    # 8. Has named institution (real)
+    has_institution= 1.0 if re.search(r"(university|institute|hospital|department|agency|committee|bureau|college)", tl) else 0.0
+    # 9. Has citation pattern (real)
+    has_citation   = 1.0 if any(re.search(p, tl) for p in CITATION_PATTERNS) else 0.0
+    # 10. Has conspiracy phrases (sensationalist fake)
+    has_conspire   = 1.0 if re.search(r"(deep state|new world order|globalist|cabal|illuminati|big pharma|shadow government)", tl) else 0.0
+    # 11. Has urgency/CTA (sensationalist fake)
+    has_urgency    = 1.0 if re.search(r"(share (this|now|before)|wake up|must (read|share|watch)|before they)", tl) else 0.0
+    # 12. Has anonymous source (fake signal)
+    has_anon       = 1.0 if re.search(r"(anonymous|unnamed|undisclosed|secret source|insider)", tl) else 0.0
+    # 13. Has vague source (calm fake signal — KEY for banana type)
+    vague_hits     = sum(1 for p in VAGUE_SOURCE_PATTERNS if re.search(p, tl))
+    has_vague      = min(vague_hits / 3.0, 1.0)
+    # 14. "Doctors warn/say" without named doctor (calm fake signal)
+    has_generic_doc= 1.0 if re.search(r"(doctors (warn|say|claim|advise|urge|caution)|experts (warn|say|claim)|health experts)", tl) else 0.0
+    # 15. Claim not linked to real study (calm fake)
+    no_real_study  = 0.0 if re.search(r"(published in|clinical trial|peer.reviewed|randomized|journal of)", tl) else 1.0
+    # 16. ALL CAPS char ratio
+    all_caps_char  = sum(1 for c in text if c.isupper()) / max(len(text), 1)
+    # 17. Contains "circulating" / "viral post" / "spreading" (calm fake)
+    has_viral      = 1.0 if re.search(r"(circulating|viral|spreading|widely shared|social media)", tl) else 0.0
+    # 18. "no official statement" / "unverified" (calm fake — KEY signal)
+    has_unverified = 1.0 if re.search(r"(no official|unverified|cannot be confirmed|not been published|no peer|cannot be found|no (hospital|institution|study))", tl) else 0.0
+    # 19. "Home remedy" / "try this" / "thousands claim" (pseudoscience)
+    has_pseudo     = 1.0 if re.search(r"(home remedy|try this|thousands claim|reportedly cured|won.t tell you|out of business|natural cure)", tl) else 0.0
+    # 20. Avg word length (real articles use longer, technical words)
+    avg_wl         = min((sum(len(w) for w in words) / wc) / 12.0, 1.0)
+
+    return [
+        caps_ratio, excl_ratio, triple_excl, fake_ratio, real_ratio,
+        net_fake, has_stats, has_institution, has_citation, has_conspire,
+        has_urgency, has_anon, has_vague, has_generic_doc, no_real_study,
+        all_caps_char, has_viral, has_unverified, has_pseudo, avg_wl
     ]
 
+
+def preprocess(text: str) -> str:
+    if not isinstance(text, str): return ""
+    text = text.lower()
+    text = re.sub(r"http\S+|www\S+", " ", text)
+    text = re.sub(r"!!!+", " multiexclaim ", text)
+    text = re.sub(r"[^a-z\s]", " ", text)
+    tokens = word_tokenize(text)
+    tokens = [lemmatizer.lemmatize(t) for t in tokens
+              if t not in STOP_WORDS and len(t) > 2]
     return " ".join(tokens)
 
 
-# ── Load Dataset ──────────────────────────────────────────────────────────────
-def load_dataset(path: str) -> pd.DataFrame:
-    """
-    Expects CSV with columns: text (or title+text), label (FAKE/REAL or 0/1)
-    Supports multiple common fake news dataset formats.
-    """
-    print(f"📂 Loading dataset from {path}...")
-    df = pd.read_csv(path)
+def load_dataset(path):
+    if not os.path.exists(path):
+        print(f"❌ Dataset not found: {path}")
+        print("👉 Run: python generate_dataset.py")
+        sys.exit(1)
 
-    # Normalize column names
+    df = pd.read_csv(path, encoding="utf-8", on_bad_lines="skip")
     df.columns = [c.lower().strip() for c in df.columns]
 
-    # Combine title + text if both exist
     if "title" in df.columns and "text" in df.columns:
         df["content"] = df["title"].fillna("") + " " + df["text"].fillna("")
     elif "text" in df.columns:
         df["content"] = df["text"].fillna("")
-    elif "title" in df.columns:
-        df["content"] = df["title"].fillna("")
     else:
-        raise ValueError("Dataset must have 'text' or 'title' column")
+        raise ValueError("Need 'text' column")
 
-    # Normalize label
-    if "label" in df.columns:
-        df["label"] = df["label"].astype(str).str.upper().str.strip()
-        df["label"] = df["label"].map(
-            lambda x: "FAKE" if x in ["FAKE", "0", "FALSE", "UNRELIABLE"]
-            else "REAL" if x in ["REAL", "1", "TRUE", "RELIABLE"]
-            else x
-        )
-    else:
-        raise ValueError("Dataset must have 'label' column (FAKE/REAL or 0/1)")
+    df["label"] = (df["label"].astype(str).str.upper().str.strip()
+        .map(lambda x: "FAKE" if x in ["FAKE","0","FALSE","UNRELIABLE"]
+                      else "REAL" if x in ["REAL","1","TRUE","RELIABLE"] else x))
+    df = df[df["label"].isin(["FAKE","REAL"])].dropna(subset=["content"])
+    df = df[df["content"].str.len() > 20].reset_index(drop=True)
 
-    # Drop rows with missing content or unknown labels
-    df = df[df["label"].isin(["FAKE", "REAL"])].dropna(subset=["content"])
-    df = df[df["content"].str.len() > 20]
-
-    print(f"✅ Loaded {len(df)} samples | FAKE: {(df['label']=='FAKE').sum()} | REAL: {(df['label']=='REAL').sum()}")
-    return df[["content", "label"]]
+    fake = (df["label"]=="FAKE").sum()
+    real = (df["label"]=="REAL").sum()
+    print(f"✅ Loaded {len(df)} | FAKE: {fake} | REAL: {real}")
+    return df[["content","label"]]
 
 
-# ── Train Models ──────────────────────────────────────────────────────────────
-def train_and_evaluate(X_train, X_test, y_train, y_test, tfidf):
-    """Train LR, NB, RF — return best model + all results."""
-
-    X_train_tfidf = tfidf.transform(X_train)
-    X_test_tfidf  = tfidf.transform(X_test)
-
-    models = {
-        "Logistic Regression": LogisticRegression(
-            max_iter=1000, C=1.0, solver="lbfgs", n_jobs=-1, random_state=42
-        ),
-        "Naive Bayes": MultinomialNB(alpha=0.1),
-        "Random Forest": RandomForestClassifier(
-            n_estimators=200, max_depth=None,
-            min_samples_split=2, n_jobs=-1, random_state=42
-        ),
-    }
-
-    results = {}
-    best_model = None
-    best_name  = None
-    best_acc   = 0.0
-
-    print("\n📊 Training & Evaluating Models:")
-    print("=" * 55)
-
-    for name, clf in models.items():
-        print(f"\n🔧 Training {name}...")
-        clf.fit(X_train_tfidf, y_train)
-        y_pred = clf.predict(X_test_tfidf)
-        y_prob = clf.predict_proba(X_test_tfidf)[:, 1]
-
-        acc     = accuracy_score(y_test, y_pred)
-        roc_auc = roc_auc_score(
-            LabelEncoder().fit_transform(y_test), y_prob
-        )
-        report  = classification_report(y_test, y_pred, output_dict=True)
-        cm      = confusion_matrix(y_test, y_pred).tolist()
-
-        results[name] = {
-            "accuracy":  round(acc,     4),
-            "roc_auc":   round(roc_auc, 4),
-            "precision": round(report["weighted avg"]["precision"], 4),
-            "recall":    round(report["weighted avg"]["recall"],    4),
-            "f1_score":  round(report["weighted avg"]["f1-score"],  4),
-            "confusion_matrix": cm,
-        }
-
-        print(f"   Accuracy : {acc:.4f}")
-        print(f"   ROC-AUC  : {roc_auc:.4f}")
-        print(f"   F1-Score : {report['weighted avg']['f1-score']:.4f}")
-
-        if acc > best_acc:
-            best_acc   = acc
-            best_model = clf
-            best_name  = name
-
-    print(f"\n🏆 Best Model: {best_name} (Accuracy: {best_acc:.4f})")
-    return best_model, best_name, results
-
-
-# ── Extract Top TF-IDF Features ───────────────────────────────────────────────
-def get_top_features(tfidf, model, n=20):
-    """Return top features for FAKE and REAL classes."""
-    try:
-        feature_names = np.array(tfidf.get_feature_names_out())
-        classes = model.classes_
-
-        top_features = {}
-        for i, cls in enumerate(classes):
-            if hasattr(model, "coef_"):
-                coef = model.coef_[0] if len(classes) == 2 else model.coef_[i]
-                indices = np.argsort(coef)
-            else:
-                continue
-            top_features[cls] = {
-                "top_positive": feature_names[indices[-n:][::-1]].tolist(),
-                "top_negative": feature_names[indices[:n]].tolist(),
-            }
-        return top_features
-    except Exception:
-        return {}
-
-
-# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     DATASET_PATH = os.path.join(os.path.dirname(__file__), "dataset", "fake_news.csv")
     MODEL_DIR    = os.path.join(os.path.dirname(__file__), "model")
     os.makedirs(MODEL_DIR, exist_ok=True)
 
-    # ── Load data
     df = load_dataset(DATASET_PATH)
-
-    # ── Preprocess
-    print("\n🔄 Preprocessing text (tokenize → stopwords → lemmatize)...")
+    print("🔄 Preprocessing...")
     df["processed"] = df["content"].apply(preprocess)
-    df = df[df["processed"].str.len() > 5]
+    df = df[df["processed"].str.len() > 5].reset_index(drop=True)
 
-    X = df["processed"]
-    y = df["label"]
+    X_raw  = df["content"].tolist()
+    X_proc = df["processed"].tolist()
+    y      = df["label"].tolist()
 
-    # ── Train/test split
-    X_train, X_test, y_train, y_test = train_test_split(
-        X, y, test_size=0.2, random_state=42, stratify=y
-    )
-    print(f"🔀 Split → Train: {len(X_train)} | Test: {len(X_test)}")
+    pairs = list(zip(X_raw, X_proc))
+    pairs_tr, pairs_te, y_train, y_test = train_test_split(
+        pairs, y, test_size=0.2, random_state=42, stratify=y)
 
-    # ── TF-IDF Vectorizer (unigrams + bigrams, top 50k features)
-    print("\n📐 Fitting TF-IDF vectorizer (unigrams + bigrams)...")
-    tfidf = TfidfVectorizer(
-        ngram_range=(1, 2),
-        max_features=50_000,
-        min_df=2,
-        max_df=0.95,
-        sublinear_tf=True,
-    )
-    tfidf.fit(X_train)
-    print(f"   Vocabulary size: {len(tfidf.vocabulary_):,}")
+    X_tr_raw = [p[0] for p in pairs_tr]; X_te_raw = [p[0] for p in pairs_te]
+    X_tr_proc= [p[1] for p in pairs_tr]; X_te_proc= [p[1] for p in pairs_te]
+    print(f"📊 Train: {len(X_tr_proc)} | Test: {len(X_te_proc)}")
 
-    # ── Train & select best model
-    best_model, best_name, results = train_and_evaluate(
-        X_train, X_test, y_train, y_test, tfidf
-    )
+    print("📐 Fitting TF-IDF (unigrams+bigrams+trigrams)...")
+    tfidf = TfidfVectorizer(ngram_range=(1,3), max_features=60_000,
+                            min_df=1, max_df=0.95, sublinear_tf=True)
+    tfidf.fit(X_tr_proc)
 
-    # ── Save artifacts
-    model_path = os.path.join(MODEL_DIR, "model.pkl")
-    tfidf_path = os.path.join(MODEL_DIR, "tfidf.pkl")
+    Xtr_tf = tfidf.transform(X_tr_proc)
+    Xte_tf = tfidf.transform(X_te_proc)
 
-    joblib.dump(best_model, model_path)
-    joblib.dump(tfidf, tfidf_path)
-    print(f"\n💾 Saved model  → {model_path}")
-    print(f"💾 Saved TF-IDF → {tfidf_path}")
+    print("🔧 Extracting 20 hand-crafted features...")
+    Xtr_h = csr_matrix(np.array([hand_features(t) for t in X_tr_raw]))
+    Xte_h = csr_matrix(np.array([hand_features(t) for t in X_te_raw]))
 
-    # ── Save training report
-    top_features = get_top_features(tfidf, best_model)
-    report = {
-        "best_model":   best_name,
-        "best_accuracy": results[best_name]["accuracy"],
-        "all_results":  results,
-        "top_features": top_features,
-        "vocab_size":   len(tfidf.vocabulary_),
-        "train_samples": len(X_train),
-        "test_samples":  len(X_test),
+    Xtr = hstack([Xtr_tf, Xtr_h])
+    Xte = hstack([Xte_tf, Xte_h])
+
+    models = {
+        "Logistic Regression": (LogisticRegression(
+            max_iter=1000, C=1.0, class_weight="balanced",
+            solver="lbfgs", n_jobs=-1, random_state=42), False),
+        "Random Forest": (RandomForestClassifier(
+            n_estimators=300, class_weight="balanced",
+            n_jobs=-1, random_state=42), False),
+        "Naive Bayes": (MultinomialNB(alpha=0.05), True),  # tfidf-only
+        "Gradient Boosting": (GradientBoostingClassifier(
+            n_estimators=200, learning_rate=0.1,
+            max_depth=4, random_state=42), False),
     }
-    report_path = os.path.join(MODEL_DIR, "training_report.json")
-    with open(report_path, "w") as f:
-        json.dump(report, f, indent=2)
-    print(f"📄 Training report → {report_path}")
-    print("\n✅ Training complete!")
 
+    results   = {}
+    best_clf  = None
+    best_name = None
+    best_f1   = 0.0
+
+    print("\n📊 Training all models...")
+    print("="*55)
+
+    for name, (clf, nb) in models.items():
+        print(f"\n▶ {name}...")
+        if nb:
+            clf.fit(Xtr_tf, y_train)
+            y_pred = clf.predict(Xte_tf)
+        else:
+            clf.fit(Xtr, y_train)
+            y_pred = clf.predict(Xte)
+
+        acc = accuracy_score(y_test, y_pred)
+        f1  = f1_score(y_test, y_pred, pos_label="FAKE")
+        print(classification_report(y_test, y_pred))
+        print(f"   Accuracy: {acc:.4f} | F1(FAKE): {f1:.4f}")
+
+        results[name] = {"accuracy": round(acc,4), "f1_fake": round(f1,4)}
+        if f1 > best_f1:
+            best_f1   = f1
+            best_name = name
+            best_clf  = (clf, nb)
+
+    print(f"\n🏆 Best: {best_name} | F1(FAKE): {best_f1:.4f}")
+
+    clf_obj, nb_flag = best_clf
+    joblib.dump(clf_obj,  os.path.join(MODEL_DIR, "model.pkl"))
+    joblib.dump(tfidf,    os.path.join(MODEL_DIR, "tfidf.pkl"))
+    joblib.dump(nb_flag,  os.path.join(MODEL_DIR, "nb_mode.pkl"))
+
+    with open(os.path.join(MODEL_DIR, "training_report.json"), "w") as f:
+        json.dump({"best_model": best_name, "best_f1_fake": best_f1,
+                   "all_results": results, "nb_mode": nb_flag}, f, indent=2)
+
+    print(f"\n✅ Done! Saved to {MODEL_DIR}/")
+    print(f"   Model    : {best_name}")
+    print(f"   F1(FAKE) : {best_f1:.4f}")
+    print(f"   Accuracy : {results[best_name]['accuracy']:.4f}")
 
 if __name__ == "__main__":
     main()
