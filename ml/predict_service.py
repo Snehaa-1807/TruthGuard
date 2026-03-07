@@ -238,6 +238,9 @@ def rule_score(text: str):
 app = Flask(__name__)
 CORS(app, origins="*")
 
+# Load model at startup — works for both `python predict_service.py` and gunicorn
+load_artifacts()
+
 @app.route("/health", methods=["GET"])
 def health():
     return jsonify({"status":"ok","model_loaded": model is not None})
