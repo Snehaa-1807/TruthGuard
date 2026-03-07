@@ -1,0 +1,18 @@
+services:
+  - type: web
+    name: truthguard-ml
+    env: python
+    region: oregon
+    plan: free
+    rootDir: ml
+    buildCommand: |
+      pip install -r requirements.txt &&
+      python -c "import nltk; nltk.download('punkt'); nltk.download('stopwords'); nltk.download('wordnet'); nltk.download('omw-1.4'); nltk.download('punkt_tab')" &&
+      python generate_dataset.py &&
+      python train_model.py
+    startCommand: gunicorn predict_service:app --bind 0.0.0.0:$PORT --timeout 120 --workers 1
+    envVars:
+      - key: ML_PORT
+        value: 10000
+      - key: PYTHON_VERSION
+        value: 3.11.8
