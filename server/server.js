@@ -9,6 +9,7 @@ const morgan     = require("morgan");
 const rateLimit  = require("express-rate-limit");
 const dotenv     = require("dotenv");
 const connectDB  = require("./config/db");
+const { startKeepAlive } = require("./utils/keepAlive");
 
 dotenv.config();
 
@@ -27,29 +28,26 @@ app.use(helmet());
 // CORS — allow any localhost port in development, specific URL in production
 const corsOptions = {
   origin: (origin, callback) => {
-    // Allow requests with no origin (mobile apps, curl, Postman)
     if (!origin) return callback(null, true);
 
     if (process.env.NODE_ENV !== "production") {
-      // In development, allow any localhost / 127.0.0.1 port
       if (/^https?:\/\/(localhost|127\.0\.0\.1)(:\d+)?$/.test(origin)) {
         return callback(null, true);
       }
     }
 
-    // In production, only allow the explicit CLIENT_URL
     const allowed = process.env.CLIENT_URL || "http://localhost:3000";
     if (origin === allowed) return callback(null, true);
 
     callback(new Error(`CORS: origin ${origin} not allowed`));
   },
   credentials: true,
-  methods: ["GET", "POST", "DELETE", "OPTIONS"],
+  methods: ["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 };
 
 app.use(cors(corsOptions));
-app.options("*", cors(corsOptions)); // handle preflight for all routes
+app.options("*", cors(corsOptions));
 
 // ── Rate Limiting ─────────────────────────────────────────────────────────────
 const globalLimiter = rateLimit({
@@ -113,6 +111,7 @@ app.listen(PORT, () => {
   console.log(`\n🚀 TruthGuard API running on http://localhost:${PORT}`);
   console.log(`🌍 Environment : ${process.env.NODE_ENV || "development"}`);
   console.log(`🔗 CORS        : ${ process.env.NODE_ENV !== "production" ? "all localhost ports" : process.env.CLIENT_URL}\n`);
+  startKeepAlive();
 });
 
 module.exports = app;
