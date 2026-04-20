@@ -59,7 +59,7 @@ const globalLimiter = rateLimit({
 });
 
 const predictLimiter = rateLimit({
-  windowMs: 60 * 1000,
+  windowMs: 60 * 4000,
   max: 10,
   message: { error: "Prediction rate limit exceeded. Max 10/minute." },
 });
